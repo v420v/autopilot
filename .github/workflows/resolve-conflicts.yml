@@ -1,0 +1,115 @@
+name: Resolve PR Conflicts
+
+# Plain GitHub Actions workflow (NOT gh-aw): runs Anthropic's official Claude Code
+# Action authenticated with a Claude Max subscription (CLAUDE_CODE_OAUTH_TOKEN), so the
+# model usage is covered by your Max plan — no extra API/Copilot billing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (skip push, follow-up PR creation & comment)"
+        type: boolean
+        default: false
+      max_prs:
+        description: "Max conflicting PRs to process per run"
+        type: string
+        default: "10"
+  schedule:
+    - cron: "5 23 * * *"  # 23:05 UTC == 08:05 JST, daily
+
+permissions:
+  contents: read
+  id-token: write   # claude-code-action fetches a GitHub OIDC token during setup
+
+concurrency:
+  group: resolve-conflicts
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve conflicts with Claude
+        uses: anthropics/claude-code-action@v1
+        env:
+          # PAT with `repo` scope on the target repos (forks included). gh and git read
+          # GH_TOKEN directly — no firewall/scrubbing here, and Claude Code (unlike the
+          # Copilot CLI) does not reject classic PATs.
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        with:
+          # Claude Max subscription auth (run `claude setup-token` locally to mint it).
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: |
+            --model sonnet
+            --max-turns 80
+            --allowedTools Bash,Read,Write,Edit,Glob,Grep
+          # `sonnet` is plenty for mechanical merge resolution and is easier on your Max
+          # quota; switch to `opus` for maximum quality.
+          prompt: |
+            You auto-resolve merge conflicts on the repository owner's own open pull
+            requests across GitHub. For each conflicting PR, open a *follow-up* PR that
+            merges the latest base branch into the PR's head branch with conflicts
+            resolved, then comment on the original PR linking to it.
+
+            Run configuration:
+            - Dry run: `${{ inputs.dry_run || 'false' }}` — when `true`, do everything
+              EXCEPT `git push`, opening the follow-up PR, and commenting.
+            - Max PRs to process: `${{ inputs.max_prs || '10' }}` — process at most this
+              many conflicting PRs; defer the rest to the next run.
+
+            `gh` and `git` are authenticated via the `GH_TOKEN` environment variable (a
+            PAT). Run `gh auth status` first; if it fails, stop and report it.
+
+            ## Step 1 — Find candidate PRs
+            1. `ME=$(gh api user --jq .login)` and print it.
+            2. List ME's open PRs across GitHub:
+               `gh search prs --author "@me" --state open "archived:false" --json url --limit 100`.
+               Parse out each `owner`, `repo`, and `number`.
+
+            ## Step 2 — Filter to processable conflicts
+            For each candidate, `gh pr view <number> --repo <owner>/<repo> --json author,state,mergeable,headRefName,baseRefName,headRepository,headRepositoryOwner,isCrossRepository,url`
+            and SKIP it (printing the reason) unless ALL hold:
+            - author login == `ME`; state == `OPEN`;
+            - `mergeable` == `CONFLICTING` (if `UNKNOWN`, GitHub is still computing — skip and let the next run retry);
+            - head branch is NOT `main`/`master`; the head repository still exists.
+            Print how many candidates and how many conflicting; cap at the Max-PRs value and print how many you deferred.
+
+            ## Step 3 — Resolve each PR (treat each independently; on error, log and continue)
+            Let `HEAD_OWNER/HEAD_REPO`, `HEAD_BRANCH`, `BASE_BRANCH` be the PR's head repo/branch and base branch.
+            1. **Skip if already resolved.** Prefix `autopilot-bot/resolve/<HEAD_BRANCH with / replaced by ->-`.
+               `gh pr list --repo HEAD_OWNER/HEAD_REPO --state open --base HEAD_BRANCH --json number,url,headRefName`;
+               if an open PR whose head starts with that prefix exists, print it and skip.
+            2. **Clone the head branch** into a temp dir INSIDE the workspace (so your
+               file-editing tools are allowed to write there): `WORKDIR=$(mktemp -d "$PWD/.resolve-XXXXXX")`
+               then `git clone --branch HEAD_BRANCH --single-branch https://x-access-token:$GH_TOKEN@github.com/HEAD_OWNER/HEAD_REPO.git "$WORKDIR"`.
+               Run later git commands with `git -C "$WORKDIR"`; `rm -rf "$WORKDIR"` when done with this PR.
+            3. **Make the base reachable.** If the PR is cross-fork, add the base repo as remote
+               `git -C "$WORKDIR" remote add upstream https://x-access-token:$GH_TOKEN@github.com/<BASE_OWNER>/<BASE_REPO>.git`
+               and `git -C "$WORKDIR" fetch upstream BASE_BRANCH:refs/remotes/upstream/BASE_BRANCH` (merge ref `upstream/BASE_BRANCH`);
+               otherwise `git -C "$WORKDIR" fetch origin BASE_BRANCH:refs/remotes/origin/BASE_BRANCH` (merge ref `origin/BASE_BRANCH`).
+            4. **Prepare the working branch.** `git -C "$WORKDIR" config user.name "autopilot[bot]"`,
+               `... config user.email "noreply@github.com"`, `... config core.hooksPath /dev/null`,
+               `... config commit.gpgSign false`. Create branch
+               `autopilot-bot/resolve/<safe-head>-<UTC YYYYMMDDHHMMSS>` via `git -C "$WORKDIR" checkout -b <branch>`.
+            5. **Merge the base.** `git -C "$WORKDIR" merge --no-ff --no-edit <merge ref>`.
+               - Clean merge (exit 0) → nothing to resolve; print and skip (no push/PR).
+               - Failure → list conflicts `git -C "$WORKDIR" diff --name-only --diff-filter=U`. If empty, the merge
+                 failed for another reason: print stderr, `git -C "$WORKDIR" merge --abort`, skip.
+            6. **Resolve every conflicted file.** Read each and rewrite it resolved:
+               the HEAD side is the PR branch (work in progress), the incoming side is the base (latest upstream).
+               Preserve both intentions when compatible; when they genuinely conflict, prefer the PR (HEAD) side.
+               Leave NO `<<<<<<<` / `=======` / `>>>>>>>` markers. Verify none remain
+               (`grep -nE '^(<{7}|={7}|>{7})' <file>` prints nothing). If any remain, `git -C "$WORKDIR" merge --abort` and skip this PR. `git -C "$WORKDIR" add` each resolved file.
+            7. **Commit** with a message summarizing the resolution and listing the resolved files; then `git -C "$WORKDIR" log -1 --stat`.
+            8. **Publish.** If Dry run is `true`, print what you would push/open and skip. Otherwise:
+               - `git -C "$WORKDIR" push origin <branch>`;
+               - `gh pr create --repo HEAD_OWNER/HEAD_REPO --base HEAD_BRANCH --head <branch> --title "fix conflict: <HEAD_BRANCH> ← <BASE_BRANCH> (#<number>)" --body "<body>"`
+                 (body: notes it auto-resolves #<number>, lists base + resolved files, says merging it updates the original PR, and to review before merging);
+               - `gh pr comment <number> --repo <owner>/<repo> --body "Opened a PR that auto-resolves the merge conflicts: #<new> — <url>. After review, merging it updates this PR."
+
+            ## Step 4 — Summary
+            Print a one-line summary: how many PRs succeeded and how many failed. Make any failures explicit.

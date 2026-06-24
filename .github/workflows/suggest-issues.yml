@@ -1,0 +1,131 @@
+name: Suggest Improvement Issues
+
+# Plain GitHub Actions workflow (NOT gh-aw): runs Anthropic's official Claude Code
+# Action authenticated with a Claude Max subscription (CLAUDE_CODE_OAUTH_TOKEN), so model
+# usage is covered by your Max plan — no extra API/Copilot billing. Manual trigger only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (don't create issues; just print what would be created)"
+        type: boolean
+        default: false
+      max_repos:
+        description: "Cap on repos processed per run (0 = all of them)"
+        type: string
+        default: "0"
+      issues_per_repo:
+        description: "Max new issues to open per repo"
+        type: string
+        default: "10"
+  schedule:
+    - cron: "0 18 * * *"   # 03:00 JST daily — implement-issues chains off this run
+
+permissions:
+  contents: read
+  id-token: write   # claude-code-action fetches a GitHub OIDC token during setup
+
+concurrency:
+  group: suggest-issues
+  cancel-in-progress: false
+
+jobs:
+  suggest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45   # deep, corner-to-corner review with opus takes longer
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Suggest improvement issues with Claude
+        uses: anthropics/claude-code-action@v1
+        env:
+          # PAT with `repo` scope: used by gh to read your stars/repos/issues AND to
+          # create issues cross-repo. gh reads GH_TOKEN directly.
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        with:
+          # Claude Max subscription auth (run `claude setup-token` locally to mint it).
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: |
+            --model opus
+            --max-turns 200
+            --allowedTools Bash,Read,Grep,Glob
+          # `opus` = Claude Opus (highest quality). The earlier opus init failure was the
+          # bad OAuth token, not Opus itself (sonnet failed identically); with the re-minted
+          # token opus should work. Caveat: Opus burns Max quota much faster than Sonnet and
+          # Max caps Opus tightly — run with a SMALL max_repos. If opus still 400s at init,
+          # your Max plan doesn't grant Opus here → switch back to `--model sonnet`.
+          prompt: |
+            You open high-quality issues — **improvements, fixes, and bugs** — on the
+            repository owner's own repositories that the owner has **starred**, after a
+            **thorough, end-to-end review of the actual code**. Do not duplicate existing issues.
+
+            Run configuration:
+            - Dry run: `${{ inputs.dry_run || 'false' }}` — when `true`, do everything
+              EXCEPT actually creating issues (print exactly what you *would* create).
+            - Repo cap: `${{ inputs.max_repos || '0' }}` — `0` means process ALL matching repos.
+            - Max new issues per repo: `${{ inputs.issues_per_repo || '10' }}`.
+
+            `gh` is authenticated via the `GH_TOKEN` environment variable (a PAT). Run
+            `gh auth status` first; if it fails, stop and report it.
+
+            **Scope guard (critical).** Targets are ONLY the repos from the Step 1 list.
+            Every `gh issue create` MUST pass `--repo <owner/repo>` from that list — never
+            run `gh issue create` without `--repo` (it would file into the wrong repo).
+
+            ## Step 1 — Find target repos
+            1. `ME=$(gh api user --jq .login)` and print it. If empty/error, auth failed — stop.
+            2. List every repo the owner has starred AND owns:
+               `gh api user/starred --paginate --jq ".[] | select(.owner.login==\"$ME\") | .full_name"`.
+               (Private repos appear only if the PAT has `repo` scope — note it if the list looks short.)
+            3. Print the complete list and the count.
+            4. If the repo cap is `0`, process ALL; otherwise process at most that many and report deferrals.
+
+            ## Step 2 — Per repo (independent; on error, log and continue)
+            1. **Clone the repo and review it thoroughly — corner to corner** (skip if archived):
+               - Metadata: `gh repo view <repo> --json name,description,primaryLanguage,languages,licenseInfo,repositoryTopics,isArchived,visibility,defaultBranchRef`.
+                 If it is archived, skip it.
+               - Clone it (shallow) into a temp dir so you can read the WHOLE tree with Read/Grep/Glob:
+                 `D=$(mktemp -d) && git clone --depth 1 "https://x-access-token:$GH_TOKEN@github.com/<repo>.git" "$D"`.
+               - **Go through it end to end.** Walk the entire tree (`ls`/Glob) and actually READ every
+                 meaningful file: entry points, core modules, helpers, configs, build scripts, CI, and
+                 the tests. Use Grep to map the codebase and hunt risky patterns. Skip only vendored /
+                 third-party deps, generated code, lockfiles, binaries, and large data/asset files.
+               - **Actively hunt for DEFECTS, not just hygiene:** correctness/logic bugs, unhandled
+                 errors and edge cases, nil/None/empty/boundary mishandling, off-by-one, race
+                 conditions & concurrency bugs, resource leaks (files/sockets/locks), injection and
+                 unsafe input handling, hardcoded secrets, performance problems, incorrect or missing
+                 tests, dependency & security hygiene, code/doc drift, and missing basics (LICENSE/
+                 README/CI). For a big repo, cover breadth first, then go deep on the riskiest areas.
+               - Remove the clone when done: `rm -rf "$D"`.
+            2. **Load existing issues for de-duplication:**
+               `gh issue list --repo <repo> --state all --limit 100 --json number,title,state,labels`.
+               You must NOT duplicate any of these (any author, any state).
+            3. **Decide what to file (real, grounded findings).** From your review, pick up to the
+               issues-per-repo value of the most valuable findings. **Prioritise real defects** —
+               bugs, correctness, security, data-loss, races — over hygiene/cosmetic items, but
+               include hygiene gaps too. Every issue MUST cite the exact evidence you saw in THIS
+               repo: the `path/to/file` and, where you can, the function or line. No generic filler
+               that could apply to any repo. Don't pad to the cap, but DO report every genuine
+               defect/improvement you found up to the cap; only return zero for a repo that is
+               genuinely clean or already has matching issues filed.
+            4. **De-duplicate.** Drop any proposed issue overlapping one from Step 2.2 (same topic). Bias toward dropping.
+            5. **Create the survivors.** For each:
+               - If Dry run is `true`: print the target repo, title, and body you *would* create; do NOT create it.
+               - Otherwise create the issue (title + body), always with `--repo` set to the TARGET repo:
+                 `gh issue create --repo <repo> --title "<concise, specific>" --body "<structured>"`.
+                 Body structure: **Problem** (what's wrong — cite `path/to/file` + function/line) →
+                 **Impact** (the bug/risk and why it matters) → **Suggested fix** (concrete steps) →
+                 **Acceptance criteria**. For a bug, add repro steps if you can infer them.
+                 Do NOT pass `--label` (a non-existent label makes `gh issue create` fail).
+               - If `gh issue create` fails, capture the FULL stderr verbatim for the summary, then continue.
+               - On success, print the created issue URL (it must point at the target repo, not this one).
+
+            ## Step 3 — Summary (make it visible, safely)
+            Build a concise **Markdown** summary and append it to the Actions run UI:
+            `printf '%s\n' "<markdown>" >> "$GITHUB_STEP_SUMMARY"` (also print it to stdout).
+            Per repo include: repo name, # existing issues seen, # proposed, # created (with
+            URLs), # skipped-as-duplicate, and — **verbatim** — any error (e.g. a failed
+            `gh issue create`). End with run totals. Keep it high level: do NOT paste repo
+            file contents. **If you created zero issues, state explicitly WHY for each repo**
+            (e.g. "all proposals duplicated existing issues", "issues disabled", or the exact error).

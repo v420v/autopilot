@@ -1,0 +1,185 @@
+name: Implement Issues
+
+# Plain GitHub Actions workflow (NOT gh-aw). Runs right after the suggest-issues workflow
+# finishes (so fresh issues exist first), plus on manual dispatch. Finds OPEN issues (in your
+# starred-own repos) without an implementation branch and implements up to `max_issues` of
+# them — ONE draft PR each — via Anthropic's Claude Code Action on your Claude Max
+# subscription. Nothing is auto-merged; you review and merge the draft PRs.
+#
+# Architecture: a cheap, deterministic `discover` job (gh only, no AI) selects the issues
+# and emits a job matrix; the `implement` job runs one Claude agent per issue.
+
+on:
+  # Chain: run right after the suggest-issues workflow finishes, so fresh issues exist first.
+  workflow_run:
+    workflows: ["Suggest Improvement Issues"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (implement locally and show the diff; do NOT push or open PRs)"
+        type: boolean
+        default: false
+      max_issues:
+        description: "Max issues to implement this run, across all repos"
+        type: string
+        default: "3"
+
+permissions:
+  contents: read
+
+# Never let two runs overlap (the schedule fires twice daily + manual) — protects the
+# "no duplicate implementation" guarantee.
+concurrency:
+  group: implement-issues
+  cancel-in-progress: false
+
+jobs:
+  # ---- 1. Pick issues to implement (deterministic; no AI, no model cost) --------------
+  discover:
+    # Chained run: proceed only if suggest-issues succeeded; always proceed on manual dispatch.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}            # PAT: read stars/issues + list branches
+      MAX_ISSUES: ${{ inputs.max_issues || '3' }}
+    outputs:
+      matrix: ${{ steps.find.outputs.matrix }}
+      has_work: ${{ steps.find.outputs.has_work }}
+    steps:
+      - name: Find open issues to implement
+        id: find
+        shell: bash
+        run: |
+          ME=$(gh api user --jq .login)
+          if [ -z "$ME" ]; then echo "gh auth failed (empty login)"; exit 1; fi
+          echo "Authenticated as: $ME"
+          set +e   # be resilient: a single repo/issue hiccup must not abort discovery
+
+          MAX="${MAX_ISSUES:-3}"
+          items='[]'
+          count=0
+
+          repos=$(gh api user/starred --paginate --jq ".[] | select(.owner.login==\"$ME\") | .full_name")
+          for R in $repos; do
+            [ "$count" -ge "$MAX" ] && break
+
+            # Issue numbers that already have a claude/issue-<N>- branch (implemented, in
+            # review, or previously attempted) — these are NEVER reprocessed (de-dup).
+            impl=$(git ls-remote --heads "https://x-access-token:${GH_TOKEN}@github.com/${R}.git" 'claude/issue-*' 2>/dev/null \
+              | sed -n 's#.*refs/heads/claude/issue-\([0-9][0-9]*\)-.*#\1#p' | sort -u)
+
+            # All open issues, oldest first so the backlog clears FIFO (gh excludes PRs).
+            open_issues=$(gh issue list --repo "$R" --state open --limit 50 --json number,title 2>/dev/null \
+              | jq -c 'sort_by(.number) | .[] | {number,title}')
+
+            while IFS= read -r row; do
+              [ -z "$row" ] && continue
+              [ "$count" -ge "$MAX" ] && break
+              n=$(printf '%s' "$row" | jq -r '.number')
+              if printf '%s\n' "$impl" | grep -qx "$n"; then
+                echo "skip ${R}#${n}: a claude/issue-${n}- branch already exists"
+                continue
+              fi
+              t=$(printf '%s' "$row" | jq -r '.title')
+              items=$(printf '%s' "$items" | jq -c --arg r "$R" --argjson n "$n" --arg t "$t" '. + [{repo:$r,number:$n,title:$t}]')
+              count=$((count + 1))
+              echo "queue ${R}#${n}: ${t}"
+            done < <(printf '%s\n' "$open_issues")
+          done
+
+          echo "Queued ${count} issue(s) (cap ${MAX})."
+          printf 'matrix=%s\n' "$(printf '%s' "$items" | jq -c '{include: .}')" >> "$GITHUB_OUTPUT"
+          if [ "$count" -gt 0 ]; then
+            echo "has_work=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_work=false" >> "$GITHUB_OUTPUT"
+          fi
+          {
+            echo "### Implement Issues — discovery"
+            echo "Queued **${count}** issue(s) (cap ${MAX})."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---- 2. Implement each picked issue, one Claude agent per job -----------------------
+  implement:
+    needs: discover
+    if: needs.discover.outputs.has_work == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write   # claude-code-action fetches a GitHub OIDC token during setup
+    strategy:
+      max-parallel: 1     # one issue at a time: bounds Max-quota burn + avoids rate limits
+      fail-fast: false    # one failed issue must not cancel the others
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Implement ${{ matrix.repo }}#${{ matrix.number }}
+        uses: anthropics/claude-code-action@v1
+        env:
+          # PAT with `repo` + `workflow` scope: clone, push the branch, open the PR, comment.
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        with:
+          # Claude Max subscription auth (run `claude setup-token` locally to mint it).
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: |
+            --model sonnet
+            --max-turns 200
+            --allowedTools Bash,Read,Edit,Write,Grep,Glob
+          # sonnet keeps Max-quota use reasonable for code work; bump to `opus` for harder
+          # implementations if your quota allows.
+          prompt: |
+            You implement exactly ONE GitHub issue and open a single **draft** PR for it.
+            Touch nothing else; do not start on any other issue.
+
+            Target: **${{ matrix.repo }}** issue **#${{ matrix.number }}**.
+            Dry run: `${{ inputs.dry_run || 'false' }}` — if `true`, implement locally and show
+            the diff, but do NOT push or open a PR.
+
+            `gh` is authenticated via the `GH_TOKEN` environment variable (a PAT). Run
+            `gh auth status` first; if it fails, stop and report it.
+
+            ## Steps
+            1. Read the issue:
+               `gh issue view ${{ matrix.number }} --repo ${{ matrix.repo }} --json title,body,state,labels,url`.
+               If its state is not OPEN, stop and report "issue not open" (do nothing else).
+               Judge whether it is an actionable code-implementation task. If it is a question,
+               discussion, design decision, or otherwise NOT something resolvable with a concrete
+               code change, do NOT force one — comment on the issue that it needs human input, note
+               that in the summary, and stop (no branch, no PR).
+            2. Clone the repo (writable) and work INSIDE it:
+               `D=$(mktemp -d) && git clone "https://x-access-token:$GH_TOKEN@github.com/${{ matrix.repo }}.git" "$D"`.
+               Set identity: `git -C "$D" config user.name "claude[bot]"` and
+               `git -C "$D" config user.email "claude[bot]@users.noreply.github.com"`.
+            3. Create a branch off the default branch:
+               `git -C "$D" checkout -b claude/issue-${{ matrix.number }}-<short-kebab-slug>`.
+               (The `claude/issue-${{ matrix.number }}-` prefix is REQUIRED — it is how de-dup works.)
+            4. **Implement the issue.** Read the relevant code (Read/Grep/Glob), then make the
+               change with Edit/Write. Keep it **tightly scoped to this issue** — no unrelated
+               refactors or drive-by changes.
+            5. **Verify.** Detect the project's toolchain and run its tests / build / lint if present
+               (npm|pnpm|yarn, pytest, go test, cargo test, make, nix, …). Network is available, so
+               you may install dependencies. Record the result; don't block the PR on pre-existing
+               unrelated failures, but note them.
+            6. Stage everything: `git -C "$D" add -A`.
+            7. **If Dry run is `true`:** print `git -C "$D" --no-pager diff --cached` and STOP here
+               (no commit, no push, no PR).
+            8. **Otherwise:**
+               - Commit: `git -C "$D" commit -m "<concise summary> (#${{ matrix.number }})"`.
+               - Push: `git -C "$D" push origin HEAD`.
+               - Open a **draft** PR (base = the repo's default branch):
+                 `gh pr create --repo ${{ matrix.repo }} --draft --head <branch> --title "<concise> (#${{ matrix.number }})" --body "<body>"`.
+                 The body MUST begin with `Closes #${{ matrix.number }}` and include: what changed and
+                 why, the test/build result, and the note "🤖 AI-generated — review before merging."
+               - Comment on the issue:
+                 `gh issue comment ${{ matrix.number }} --repo ${{ matrix.repo }} --body "Opened a draft PR: <url>"`.
+            9. Append a short block to `$GITHUB_STEP_SUMMARY`: repo, issue, branch, PR URL (or
+               "dry-run"), files changed, test result, and — verbatim — any error.
+
+            If a required step (clone / push / PR) fails, append the exact error to
+            `$GITHUB_STEP_SUMMARY` and exit non-zero so this job is marked failed.
