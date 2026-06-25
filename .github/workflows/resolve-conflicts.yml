@@ -43,6 +43,10 @@ jobs:
         with:
           # Claude Max subscription auth (run `claude setup-token` locally to mint it).
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Authenticate git/gh with the PAT so the agent can clone/push/PR ACROSS repos.
+          # Without this the action uses the claude[bot] app token (this repo only) and
+          # cross-repo pushes get "denied to claude[bot] ... 403".
+          github_token: ${{ secrets.GH_TOKEN }}
           claude_args: |
             --model sonnet
             --max-turns 80

@@ -46,6 +46,9 @@ jobs:
         with:
           # Claude Max subscription auth (run `claude setup-token` locally to mint it).
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Authenticate git/gh with the PAT so the agent can clone repos ACROSS accounts
+          # (incl. private) as you, not the claude[bot] app token (this repo only).
+          github_token: ${{ secrets.GH_TOKEN }}
           claude_args: |
             --model opus
             --max-turns 200
