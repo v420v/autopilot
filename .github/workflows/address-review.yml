@@ -4,8 +4,9 @@ name: Address Review Feedback
 # Action authenticated with a Claude Max subscription (CLAUDE_CODE_OAUTH_TOKEN), so model
 # usage is covered by your Max plan — no extra API/Copilot billing.
 #
-# The "redo" worker. For each of your open PRs whose latest autopilot review verdict is
-# `changes-requested` (recorded by the review-prs workflow as a marker comment), it reads
+# The "redo" worker. For each of your open PRs (in your starred-own repos) whose latest
+# autopilot review verdict is `changes-requested` (recorded by the review-prs workflow as a
+# marker comment), it reads
 # the findings, checks out the PR's head branch, applies fixes scoped to those findings,
 # and pushes to the SAME branch — updating the PR in place. The new head SHA makes the next
 # review-prs run re-review; the loop converges when the review passes, or stops at
@@ -53,7 +54,7 @@ jobs:
     permissions:
       contents: read
     env:
-      GH_TOKEN: ${{ secrets.GH_TOKEN }} # PAT: search your PRs + read PR comments
+      GH_TOKEN: ${{ secrets.GH_TOKEN }} # PAT: read your stars + search your PRs + read PR comments
       MAX_PRS: ${{ inputs.max_prs || '10' }}
       MAX_ROUNDS: ${{ inputs.max_rounds || '3' }}
     outputs:
@@ -74,12 +75,22 @@ jobs:
           items='[]'
           count=0
 
+          # Scope to the SAME repos as implement-issues / suggest-issues: repos you OWN and
+          # have STARRED. PRs outside this set are ignored even if a review marker exists.
+          stars=$(gh api user/starred --paginate --jq ".[] | select(.owner.login==\"$ME\") | .full_name")
+          if [ -z "$stars" ]; then echo "No starred-own repos found — nothing to do."; fi
+
           urls=$(gh search prs --author "@me" --state open "archived:false" --json url --limit 100 --jq '.[].url')
           for url in $urls; do
             [ "$count" -ge "$MAX" ] && break
             R=$(printf '%s' "$url" | sed -n 's#https://github.com/\([^/]*/[^/]*\)/pull/.*#\1#p')
             n=$(printf '%s' "$url" | sed -n 's#.*/pull/\([0-9][0-9]*\).*#\1#p')
             { [ -z "$R" ] || [ -z "$n" ]; } && continue
+
+            # Skip PRs that aren't in a starred-own repo (the scope guard).
+            if ! printf '%s\n' "$stars" | grep -qxF "$R"; then
+              echo "skip ${R}#${n}: not a starred-own repo"; continue
+            fi
 
             view=$(gh pr view "$n" --repo "$R" --json headRefOid,headRefName,state,comments 2>/dev/null)
             [ -z "$view" ] && continue
