@@ -5,8 +5,10 @@ name: Review Pull Requests
 # usage is covered by your Max plan — no extra API/Copilot billing.
 #
 # Reviews your own OPEN pull requests across GitHub (chiefly the draft PRs that
-# implement-issues opens) corner-to-corner for correctness, then records a verdict ON the
-# PR as a sticky comment carrying a machine-readable marker:
+# implement-issues opens) corner-to-corner for correctness AND gates on the PR's own CI
+# checks — a PR whose checks are red is never approved; one whose checks are still running is
+# deferred to a later run — then records a verdict ON the PR as a sticky comment carrying a
+# machine-readable marker:
 #
 #     <!-- autopilot-review headSha=<sha> verdict=<changes-requested|approved> round=<n> -->
 #
@@ -124,10 +126,27 @@ jobs:
               continue
             fi
 
-            items=$(printf '%s' "$items" | jq -c --arg r "$R" --argjson n "$n" --argjson rd "$nextRound" \
-              '. + [{repo:$r,number:$n,round:$rd}]')
+            # CI gate: never spend a Claude review while the PR's checks are still running —
+            # defer to a later run. Record the settled result so the review can factor it in
+            # (and so a red PR can never be approved). No checks configured → "none".
+            cjson=$(gh pr checks "$n" --repo "$R" --json bucket 2>/dev/null)
+            if [ -z "$cjson" ] || [ "$cjson" = "[]" ]; then
+              checks="none"
+            else
+              cb=$(printf '%s' "$cjson" | jq -r '.[].bucket')
+              if printf '%s\n' "$cb" | grep -qx pending; then
+                echo "defer ${R}#${n}: CI checks still pending"; continue
+              elif printf '%s\n' "$cb" | grep -qxE '(fail|cancel)'; then
+                checks="fail"
+              else
+                checks="pass"
+              fi
+            fi
+
+            items=$(printf '%s' "$items" | jq -c --arg r "$R" --argjson n "$n" --argjson rd "$nextRound" --arg ck "$checks" \
+              '. + [{repo:$r,number:$n,round:$rd,checks:$ck}]')
             count=$((count + 1))
-            echo "queue ${R}#${n}: review round ${nextRound}"
+            echo "queue ${R}#${n}: review round ${nextRound} (checks: ${checks})"
           done
 
           echo "Queued ${count} PR(s) for review (cap ${MAX}); ${escalated} at round cap."
@@ -192,6 +211,21 @@ jobs:
             3. If the PR body says `Closes #N` (or similar), read that issue:
                `gh issue view N --repo ${{ matrix.repo }} --json title,body`. The PR must
                actually satisfy it.
+            4. **Inspect the PR's own CI checks — REQUIRED. A PR with failing checks is NOT
+               approvable, period.** Discovery saw checks = `${{ matrix.checks }}`; confirm the
+               LIVE status yourself:
+               `gh pr checks ${{ matrix.number }} --repo ${{ matrix.repo }}` and, for detail,
+               `gh pr checks ${{ matrix.number }} --repo ${{ matrix.repo }} --json name,bucket,state,link,workflow`.
+               - If any check is still **pending / in-progress**, do NOT post any verdict: print
+                 "checks still running — deferring" and STOP (exit 0; a later run re-reviews).
+               - If any check is **failed / cancelled**, you MUST finish at `changes-requested`.
+                 For EACH failed check, fetch the real cause so the fixer can act: for a GitHub
+                 Actions check, take the run id from its `link`
+                 (`.../actions/runs/<run-id>/...`) and run
+                 `gh run view <run-id> --repo ${{ matrix.repo }} --log-failed` (or
+                 `gh run view --job <job-id> --repo ${{ matrix.repo }} --log`) and quote the key
+                 failing lines; for a non-Actions check, cite its name, description, and `link`.
+                 Record each as a top-priority finding: `CI: <check name> — <what failed> — <fix>`.
 
             ## Step 2 — Review for real DEFECTS (the whole point: catch what's wrong)
             Clone the head at this PR so you can read changed files IN CONTEXT, not just the diff:
@@ -210,12 +244,16 @@ jobs:
             Remove the clone: `rm -rf "$D"`. Be specific and grounded — every finding must cite
             evidence from THIS PR. No generic filler.
 
-            ## Step 3 — Decide the verdict
-            - **changes-requested** — any real defect that should block merge. List EACH finding
-              so the fixer can act: `path/to/file:line` → **what's wrong** → **why it's wrong** →
-              **required fix** (concrete). Order by severity. Be precise; the fixer only sees
-              your comment.
-            - **approved** — no blocking defect (nits are fine to mention but don't block).
+            ## Step 3 — Decide the verdict (the PR's CI status is a HARD gate)
+            - **changes-requested** if EITHER any CI check failed/cancelled (Step 1.4) OR your
+              own review found a real defect that should block merge. List EACH finding so the
+              fixer can act — **CI failures FIRST** — as `path/to/file:line` (or `CI: <check>`) →
+              **what's wrong** → **why it's wrong** → **required fix** (concrete). Order by
+              severity. Be precise; the fixer only sees your comment.
+            - **approved** ONLY when ALL hold: every CI check passed (or there are none), your own
+              test/build/lint run was clean, and you found no blocking defect. **Never approve a
+              PR whose checks are red — that is exactly the bug this gate prevents.** (Nits may be
+              mentioned without blocking.)
 
             ## Step 4 — Record the verdict ON the PR (skip all writes if Dry run is `true`)
             Post ONE comment whose body is EXACTLY this shape (the HTML marker on its own first

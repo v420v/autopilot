@@ -39,8 +39,10 @@ The **review-prs ⇄ address-review** loop is bounded: `review-prs` records a ve
 machine-readable marker comment on the PR, `address-review` fixes and pushes (moving the head
 SHA), and the next `review-prs` run re-reviews. It converges when the review approves (the
 draft PR is marked ready for you) or stops after `max_rounds` rounds (default 3), after which a
-still-failing PR is left for you. GitHub forbids formally approving your own PRs, so the verdict
-lives in the comment marker — not a GitHub "review" — and drives the automation.
+still-failing PR is left for you. The review **never approves a PR whose CI checks are red**
+(and defers while checks are still running), so CI failures loop back through `address-review`
+rather than reaching you. GitHub forbids formally approving your own PRs, so the verdict lives in
+the comment marker — not a GitHub "review" — and drives the automation.
 
 ## Setup
 
