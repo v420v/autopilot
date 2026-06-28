@@ -49,14 +49,16 @@ Prerequisites: a Cloudflare account and a GitHub PAT. `nix develop` provides the
    npm run build
    ```
 
-4. **Configure & apply:**
+4. **Configure & apply** (state is in R2 — do the one-time
+   [R2 setup](#continuous-deployment) first):
 
    ```sh
    cd ../terraform
    cp terraform.tfvars.example terraform.tfvars   # set cloudflare_account_id
    export CLOUDFLARE_API_TOKEN=...                 # Cloudflare token (step 2)
    export TF_VAR_github_token=...                  # GitHub PAT (step 1)
-   terraform init
+   export AWS_ACCESS_KEY_ID=...  AWS_SECRET_ACCESS_KEY=...  # R2 S3 keys
+   terraform init -backend-config=r2.backend.hcl
    terraform plan
    terraform apply
    ```
@@ -71,15 +73,67 @@ Prerequisites: a Cloudflare account and a GitHub PAT. `nix develop` provides the
 - After a tick, the runs appear under the repo's **Actions** tab marked
   "triggered via workflow_dispatch".
 
+## Continuous deployment
+
+[`deploy-scheduler.yml`](../.github/workflows/deploy-scheduler.yml) runs
+`terraform apply` automatically on **push to `main`** that touches
+`infra/scheduler/**` or `infra/terraform/**` (also runnable via *Run workflow*).
+It builds the Worker and applies, so editing the worker or its schedule
+redeploys itself. It is **main-only** and serialized (one apply at a time).
+
+CI needs **shared remote state** — a fresh runner has no local state — so state
+lives in **Cloudflare R2** (S3-compatible), keeping everything on Cloudflare.
+
+**One-time setup:**
+
+1. **R2 bucket** — create a *private* bucket, e.g. `autopilot-tfstate`
+   (dashboard → R2 → Create bucket). It stores Terraform state, which contains
+   the `github_token`, so it must stay private.
+2. **R2 API token** — R2 → *Manage R2 API Tokens* → create a token with **Object
+   Read & Write**; this yields an S3 **Access Key ID** and **Secret Access Key**.
+3. **Repo secrets** (Settings → Secrets and variables → Actions → *Secrets*):
+
+   | Secret | Value |
+   | --- | --- |
+   | `CLOUDFLARE_API_TOKEN` | Cloudflare token (Workers Scripts: Edit) |
+   | `R2_ACCESS_KEY_ID` | R2 Access Key ID |
+   | `R2_SECRET_ACCESS_KEY` | R2 Secret Access Key |
+   | `GH_TOKEN` | already set — reused as the Worker's dispatch token |
+
+4. **Repo variables** (same page → *Variables*):
+
+   | Variable | Value |
+   | --- | --- |
+   | `CLOUDFLARE_ACCOUNT_ID` | your Cloudflare account ID |
+   | `TFSTATE_BUCKET` | the R2 bucket name (e.g. `autopilot-tfstate`) |
+
+5. **Migrate your existing local state to R2** (one time, locally). Create
+   `infra/terraform/r2.backend.hcl` (gitignored):
+
+   ```hcl
+   bucket    = "autopilot-tfstate"
+   endpoints = { s3 = "https://<ACCOUNT_ID>.r2.cloudflarestorage.com" }
+   ```
+
+   then move the state:
+
+   ```sh
+   cd infra/terraform
+   export AWS_ACCESS_KEY_ID=...  AWS_SECRET_ACCESS_KEY=...   # R2 S3 keys
+   terraform init -migrate-state -backend-config=r2.backend.hcl   # answer "yes"
+   ```
+
+After that, pushing a worker or Terraform change to `main` deploys it
+automatically, and local + CI share the R2 state.
+
 ## Notes
 
 - **Cutover order:** apply Terraform and confirm a dispatch works *before* merging
   the workflow changes that drop the GitHub `schedule:` triggers, so there's no
   scheduling gap. A brief overlap is harmless — each workflow's skip-guard drops a
   duplicate tick if a run is already active.
-- The `github_token` is stored as a Worker `secret_text` binding, so it lands in
-  Terraform state. Keep state private (local `*.tfstate` is gitignored here; use
-  an encrypted remote backend if you share it).
+- The `github_token` is a Worker `secret_text` binding, so it lands in Terraform
+  state — which is why the R2 state bucket must stay private.
 - After editing `scheduler/src/index.ts`, run `npm run build` so `dist/index.js`
   (and thus `content_sha256`) changes — the next `terraform apply` redeploys.
   Keep the cron strings in `src/index.ts` and `terraform/main.tf` in sync.

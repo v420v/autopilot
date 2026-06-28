@@ -1,0 +1,71 @@
+name: Deploy Scheduler
+
+# Auto-deploy the Cloudflare scheduler (Worker + cron triggers) with Terraform
+# whenever its source or config changes on main. The apply is idempotent and
+# Terraform state lives in Cloudflare R2, so re-running is safe. See
+# infra/README.md → "Continuous deployment" for the one-time R2 setup.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infra/scheduler/**"
+      - "infra/terraform/**"
+      - ".github/workflows/deploy-scheduler.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One deploy at a time; never cancel an apply that is already running.
+concurrency:
+  group: deploy-scheduler
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # main only — also guards manual runs dispatched from another branch.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: infra/terraform
+    env:
+      # Cloudflare provider auth.
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      # R2 (S3 backend) credentials for Terraform state.
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      # Terraform input variables.
+      TF_VAR_cloudflare_account_id: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      TF_VAR_github_token: ${{ secrets.GH_TOKEN }}
+      # consumed by the R2 backend config step below
+      TFSTATE_BUCKET: ${{ vars.TFSTATE_BUCKET }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: infra/scheduler/package-lock.json
+      - name: Build worker (tsc → dist/index.js)
+        working-directory: infra/scheduler
+        run: |
+          npm ci
+          npm run build
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.15.5
+          terraform_wrapper: false
+
+      - name: Configure R2 backend
+        run: |
+          cat > r2.backend.hcl <<EOF
+          bucket    = "$TFSTATE_BUCKET"
+          endpoints = { s3 = "https://$TF_VAR_cloudflare_account_id.r2.cloudflarestorage.com" }
+          EOF
+
+      - run: terraform init -backend-config=r2.backend.hcl
+      - run: terraform apply -auto-approve -input=false
