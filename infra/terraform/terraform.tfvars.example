@@ -1,0 +1,13 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored.
+#
+# Auth is via environment variables (do NOT put tokens in this file):
+#   export CLOUDFLARE_API_TOKEN=...   # Cloudflare API token, "Workers Scripts: Edit"
+#   export TF_VAR_github_token=...    # GitHub PAT (Actions: read & write on the repo)
+
+cloudflare_account_id = "your-cloudflare-account-id"
+
+# Optional overrides (defaults shown):
+# github_owner = "v420v"
+# github_repo  = "autopilot"
+# git_ref      = "main"
+# worker_name  = "autopilot-scheduler"

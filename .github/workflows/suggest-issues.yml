@@ -19,8 +19,6 @@ on:
         description: "Max new issues to open per repo"
         type: string
         default: "10"
-  schedule:
-    - cron: "0 18 * * *"   # 03:00 JST daily — implement-issues chains off this run
 
 permissions:
   contents: read

@@ -32,3 +32,20 @@ jobs:
             experimental-features = nix-command flakes
       - run: nix flake check
       - run: nix develop --command true
+
+  worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: infra/scheduler
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: infra/scheduler/package-lock.json
+      - run: npm ci
+      - name: Typecheck + build worker (strict tsc)
+        run: npm run build

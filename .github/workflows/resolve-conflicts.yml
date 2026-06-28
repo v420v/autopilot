@@ -15,8 +15,6 @@ on:
         description: "Max conflicting PRs to process per run"
         type: string
         default: "10"
-  schedule:
-    - cron: "*/15 * * * *"  # every 15 min; the guard job below drops a tick if a run is still active
 
 permissions:
   contents: read

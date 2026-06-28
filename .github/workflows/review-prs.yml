@@ -43,8 +43,6 @@ on:
         description: "Max automated review rounds per PR before escalating to you"
         type: string
         default: "3"
-  schedule:
-    - cron: "*/15 * * * *"   # every 15 min; the discover skip-guard drops a tick if a run is still active
 
 permissions:
   contents: read

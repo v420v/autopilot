@@ -19,8 +19,6 @@ name: Slack Status Board
 # The existing GH_TOKEN PAT is reused for run reads and for managing the SLACK_BOARD_TS variable.
 
 on:
-  schedule:
-    - cron: "*/15 * * * *" # every 15 min, matching the tracked workflows' cadence
   workflow_run:
     workflows:
       - "Review Pull Requests"
@@ -89,7 +87,7 @@ jobs:
           }
           # --- build Block Kit blocks ------------------------------------------------------
           blocks=$(jq -n '[{type:"header", text:{type:"plain_text", text:"🤖 Autopilot — Workflow Status", emoji:true}}]')
-          # name | workflow file | cron (empty cron = chain-triggered, no schedule)
+          # name | workflow file | cron (cadence the Cloudflare scheduler dispatches at; empty = chain-triggered only)
           workflows=(
             "Review Pull Requests|review-prs.yml|*/15 * * * *"
             "Address Review Feedback|address-review.yml|*/15 * * * *"
