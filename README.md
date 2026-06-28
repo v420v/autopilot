@@ -3,27 +3,7 @@
 Life-automation batches: scheduled / manual GitHub Actions that run
 [Claude Code Action](https://github.com/anthropics/claude-code-action)
 
-## Flow
-
-```mermaid
-flowchart LR
-    S["suggest-issues<br/>(daily)"] -->|opens| I["Issues"]
-    I --> M["implement-issues<br/>(after suggest-issues)"]
-    M -->|draft| P["Pull Requests"]
-    R["resolve-conflicts<br/>(every 15m)"] -->|keep mergeable| P
-    P --> V["review-prs<br/>(after implement)"]
-    V -->|changes requested| A["address-review"]
-    A -->|push fixes| P
-    V -->|approved → ready| U["You<br/>review / merge"]
-    U -.->|repos improve| S
-
-    classDef job fill:#f0f0f0,stroke:#888,color:#222;
-    classDef artifact fill:#fafafa,stroke:#bbb,color:#222;
-    classDef human fill:#ffffff,stroke:#444,stroke-width:2px,color:#111;
-    class S,M,R,V,A job
-    class I,P artifact
-    class U human
-```
+![workflow-diagram](.github/workflows/github_actions.png)
 
 ## Batches
 
