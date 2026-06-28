@@ -22,42 +22,78 @@ permissions:
 
 # No `concurrency` group on purpose. A group with cancel-in-progress:false would QUEUE a
 # scheduled tick that arrives mid-run and run it right after — but we want such ticks
-# SKIPPED. Overlap is instead prevented by the `guard` job below (it drops the run when an
-# older run of this workflow is still active).
+# SKIPPED. Overlap is instead prevented by the skip-guard at the top of `discover` below
+# (it drops the run when an older run of this workflow is still active). `discover` also
+# skips the (AI) resolve job entirely when none of your open PRs are currently conflicting.
 
 jobs:
-  # ---- Skip-guard (no AI): drop this run if another, older run is still active ----------
-  guard:
+  # ---- Discover (no AI): skip the run when it would overlap OR there's nothing to do -----
+  discover:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
+    permissions:
+      contents: read
     env:
-      GH_TOKEN: ${{ secrets.GH_TOKEN }}   # PAT: read this repo's workflow runs
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}   # PAT: read this repo's runs + search your PRs
     outputs:
-      proceed: ${{ steps.check.outputs.proceed }}
+      has_work: ${{ steps.check.outputs.has_work }}
     steps:
-      - name: Skip if another run of this workflow is already active
+      - name: Skip unless an open PR of yours is currently conflicting
         id: check
         shell: bash
         run: |
-          # Manual dispatch always proceeds. For scheduled ticks, yield to any OLDER active run
-          # (run ids increase monotonically) so runs never overlap; if two ever race, exactly
-          # one (the oldest) proceeds.
-          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-            echo "manual dispatch — proceeding"; echo "proceed=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          active=$(gh api "/repos/$GITHUB_REPOSITORY/actions/workflows/resolve-conflicts.yml/runs?per_page=100" \
-            --jq "[.workflow_runs[] | select(.status != \"completed\") | select(.id < $GITHUB_RUN_ID)] | length" 2>/dev/null)
-          if [ "${active:-0}" -gt 0 ]; then
-            echo "Another run is already active ($active older run(s)) — skipping this tick."
-            echo "proceed=false" >> "$GITHUB_OUTPUT"
-            echo "### Resolve PR Conflicts — skipped (another run already active)" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "no older active run — proceeding"; echo "proceed=true" >> "$GITHUB_OUTPUT"
+          ME=$(gh api user --jq .login)
+          if [ -z "$ME" ]; then echo "gh auth failed (empty login)"; exit 1; fi
+          echo "Authenticated as: $ME"
+          set +e
+
+          # Skip-guard: if another (older) run of THIS workflow is still active, drop this run so
+          # scheduled ticks never overlap (manual dispatch bypasses this). Run ids increase
+          # monotonically, so we yield only to an OLDER run — if two ever race, exactly one wins.
+          if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
+            active=$(gh api "/repos/$GITHUB_REPOSITORY/actions/workflows/resolve-conflicts.yml/runs?per_page=100" \
+              --jq "[.workflow_runs[] | select(.status != \"completed\") | select(.id < $GITHUB_RUN_ID)] | length" 2>/dev/null)
+            if [ "${active:-0}" -gt 0 ]; then
+              echo "Another run is already active ($active older run(s)) — skipping this tick."
+              echo "has_work=false" >> "$GITHUB_OUTPUT"
+              echo "### Resolve PR Conflicts — skipped (another run already active)" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
           fi
 
+          # Is at least one of MY open PRs currently CONFLICTING? If not, skip the AI resolve
+          # job. Mirrors the resolve step's own filter; UNKNOWN mergeable (GitHub still
+          # computing) is treated as not-yet-actionable and retried on the next run.
+          count=0
+          urls=$(gh search prs --author "@me" --state open "archived:false" --json url --limit 100 --jq '.[].url')
+          for url in $urls; do
+            R=$(printf '%s' "$url" | sed -n 's#https://github.com/\([^/]*/[^/]*\)/pull/.*#\1#p')
+            n=$(printf '%s' "$url" | sed -n 's#.*/pull/\([0-9][0-9]*\).*#\1#p')
+            { [ -z "$R" ] || [ -z "$n" ]; } && continue
+            view=$(gh pr view "$n" --repo "$R" --json state,mergeable,headRefName 2>/dev/null)
+            [ -z "$view" ] && continue
+            [ "$(printf '%s' "$view" | jq -r '.state')" != "OPEN" ] && continue
+            [ "$(printf '%s' "$view" | jq -r '.mergeable')" != "CONFLICTING" ] && continue
+            head=$(printf '%s' "$view" | jq -r '.headRefName')
+            case "$head" in main | master) continue ;; esac
+            count=$((count + 1))
+            echo "conflicting: ${R}#${n} (${head})"
+          done
+
+          echo "Found ${count} conflicting PR(s)."
+          if [ "$count" -gt 0 ]; then echo "has_work=true" >> "$GITHUB_OUTPUT"; else echo "has_work=false" >> "$GITHUB_OUTPUT"; fi
+          {
+            echo "### Resolve PR Conflicts — discovery"
+            if [ "$count" -gt 0 ]; then
+              echo "Found **${count}** conflicting PR(s) to resolve."
+            else
+              echo "No conflicting PRs — skipped."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
   resolve:
-    needs: guard
-    if: needs.guard.outputs.proceed == 'true'
+    needs: discover
+    if: needs.discover.outputs.has_work == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
