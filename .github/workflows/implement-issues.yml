@@ -28,8 +28,8 @@ on:
 permissions:
   contents: read
 
-# Never let two runs overlap (the schedule fires twice daily + manual) — protects the
-# "no duplicate implementation" guarantee.
+# Never let two runs overlap (runs once daily via the suggest-issues workflow_run
+# chain, plus manual dispatch) — protects the "no duplicate implementation" guarantee.
 concurrency:
   group: implement-issues
   cancel-in-progress: false
